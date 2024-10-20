@@ -108,11 +108,7 @@ checkTypeIsGen checkSide sig = do
   let (targetType, targetTypeArgs) = unAppAny targetType
 
   -- check out applications types
-  targetTypeArgs <- for targetTypeArgs $ \case
-    PosApp     arg => pure arg
-    NamedApp n arg => failAt targetTypeFC "Target types with implicit type parameters are not supported yet"
-    AutoApp    arg => failAt targetTypeFC "Target types with `auto` implicit type parameters are not supported yet"
-    WithApp    arg => failAt targetTypeFC "Unexpected `with`-application in the target type"
+  let targetTypeArgs = targetTypeArgs <&> getExpr
 
   ------------------------------------------
   -- Working with the target type familly --
@@ -371,3 +367,19 @@ deriveGenFor a = do
   sig <- quote a
   tt <- deriveGenExpr sig
   check tt
+
+||| Declares `main : IO Unit` function that prints derived generator for the given generator's signature
+export
+deriveGenPrinter : {default True printTTImp : Bool} -> DerivatorCore => Type -> Elab Unit
+deriveGenPrinter ty = do
+  ty <- quote ty
+  logSugaredTerm "deptycheck.derive.print" DefaultLogLevel "type" ty
+  expr <- deriveGenExpr ty
+  expr <- quote expr
+  printTTImp <- quote printTTImp
+  declare `[
+    main : IO Unit
+    main = do
+      putStr $ if ~printTTImp then interpolate ~expr else show ~expr
+      putStrLn ""
+  ]

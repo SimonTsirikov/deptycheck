@@ -8,11 +8,12 @@ import Control.Monad.State
 import public Control.Monad.State.Interface
 
 import Data.Bool
+import public Data.CheckedEmpty.List.Lazy
 import Data.Fuel
 import public Data.Nat1
 import Data.List
 import Data.List.Lazy
-import public Data.CheckedEmpty.List.Lazy
+import Data.List.Lazy.Extra
 import Data.Singleton
 import Data.SnocList
 import Data.Stream
@@ -21,6 +22,8 @@ import Data.Vect
 import Decidable.Equality
 
 import public Language.Implicits.IfUnsolved
+
+import Syntax.WithProof
 
 import public Test.DepTyCheck.Gen.Emptiness
 import public Test.DepTyCheck.Gen.Labels
@@ -242,6 +245,11 @@ export
 unGenAll : RandomGen g => (seed : g) -> Gen1 a -> Stream a
 unGenAll = map snd .: unGenAll'
 
+||| Picks one random value from a generator
+export
+pick1 : CanInitSeed g m => Functor m => Gen1 a -> m a
+pick1 gen = initSeed <&> \s => evalRandom s $ unGen1 gen
+
 --- Possibly empty generators ---
 
 export
@@ -270,6 +278,16 @@ unGenTryAll = map snd .: unGenTryAll'
 export
 unGenTryN : RandomGen g => (n : Nat) -> g -> Gen em a -> LazyList a
 unGenTryN n = mapMaybe id .: take (limit n) .: unGenTryAll
+
+||| Tries once to pick a random value from a generator
+export
+pick : CanInitSeed g m => Functor m => Gen em a -> m $ Maybe a
+pick gen = initSeed <&> \s => evalRandom s $ unGen' gen
+
+||| Tries to pick a random value from a generator, returning the number of unsuccessful attempts, if generated successfully
+export
+pickTryN : CanInitSeed g m => Functor m => (n : Nat) -> Gen em a -> m $ Maybe (Fin n, a)
+pickTryN n g = initSeed <&> \s => head' (withIndex $ unGenTryN n s g) >>= \(i, x) => natToFin i n <&> (,x)
 
 -- TODO To add config and Reader for that.
 --      This config should contain attempts count for each `unGen` (including those in combinators)
@@ -507,6 +525,15 @@ elements' xs = elements $ relaxF $ fromList $ toList xs
 --- Analysis of generators ---
 ------------------------------
 
+||| Shallow alternatives of a generator.
+|||
+||| If the given generator is made by one of `oneOf`, `frequency` or `elements`,
+||| this function returns alternatives which this generators contains.
+||| Otherwise it retuns a single-element alternative list containing given generator.
+|||
+||| In a sense, this function is a reverse function of `oneOf`, i.g.
+||| `oneOf $ alternativesOf g` must be equivalent to `g` and
+||| `alternativesof $ oneOf gs` must be equivalent to `gs`.
 export
 alternativesOf : {em : _} -> Gen em a -> GenAlternatives True em a
 alternativesOf $ OneOf oo     = MkGenAlts $ unGenAlts $ mapOneOf oo relax
@@ -585,6 +612,48 @@ export
 {em : _} -> Monad (GenAlternatives True em) where
   xs >>= f = flip processAlternatives' xs $ alternativesOf . (>>= oneOf . f)
 
+----------------------------------------
+--- Additional composition functions ---
+----------------------------------------
+
+||| Associative composition of two generators, merging shallow alternatives of given two generators
+|||
+||| This operation being applied to arguments `a` and `b` is *not* the same as `oneOf [a, b]`.
+||| Generator ``a `withAlts` b`` has equal probabilities of all shallow alternatives of generators `a` and `b`.
+||| For example, when there are generators
+||| ```idris
+||| g1 = oneOf [elems [0, 1, 2, 3], elems [4, 5]]
+||| g2 = oneOf elemts [10, 11, 12, 13, 14, 15]
+||| ```
+||| generator ``g1 `withAlts` g2`` would be equivalent to
+||| `oneOf [elems [0, 1, 2, 3], elems [4, 5], pure 10, pure 11, pure 12, pure 13, pure 14, pure 15]`.
+|||
+||| In other words, ``a `withAlts` b`` must be equivalent to `oneOf $ alternativesOf a ++ alternativesOf b`.
+export %inline
+withAlts : {em : _} -> Gen em a -> Gen em a -> Gen em a
+a `withAlts` b = oneOf $ alternativesOf a ++ alternativesOf b
+
+-- As of `<|>`
+export
+infixr 2 `withAlts`
+
+||| Associative composition of two generators, merging deep alternatives of given two generators
+|||
+||| This operation being applied to arguments `a` and `b` is *not* the same as `oneOf [a, b]`.
+||| Generator ``a `withDeepAlts` b`` has equal probabilities of all deep alternatives of generators `a` and `b`.
+||| For example, when there are generators
+||| ```idris
+||| g1 = oneOf [elems [0, 1, 2, 3], elems [4, 5]]
+||| g2 = oneOf elemts [10, 11, 12, 13, 14, 15]
+||| ```
+||| generator ``withDeepAlts n g1 g2`` with `n >= 2` would be equivalent to
+||| `oneOf elements [0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15]`.
+|||
+||| In other words, ``withDeepAlts d a b`` must be equivalent to `oneOf $ deepAlternativesOf d a ++ deepAlternativesOf d b`.
+export %inline
+withDeepAlts : {em : _} -> (depth : Nat) -> Gen em a -> Gen em a -> Gen em a
+withDeepAlts depth a b = oneOf $ deepAlternativesOf depth a ++ deepAlternativesOf depth b
+
 -----------------
 --- Filtering ---
 -----------------
@@ -619,6 +688,37 @@ suchThat_dec g f = mapMaybe d g where
 export
 suchThat_invertedEq : DecEq b => Gen em a -> (y : b) -> (f : a -> b) -> Gen0 $ Subset a $ \x => y = f x
 suchThat_invertedEq g y f = g `suchThat_dec` \x => y `decEq` f x
+
+||| More elegant version of `suchThat_withPrf` for fuelled generators.
+|||
+||| Tries to repeat generation until there is some fuel, and fallback to `suchThat_withPrf` in case there isn't.
+export
+retryUntil_withPrf : (p : a -> Bool) -> (Fuel -> Gen em a) -> Fuel -> Gen0 $ a `Subset` So . p
+retryUntil_withPrf p f Dry           = f Dry `suchThat_withPrf` p
+retryUntil_withPrf p f fl'@(More fl) = do
+  x <- relax $ f fl'
+  case @@ p x of
+    (True ** prf) => pure $ Element x $ eqToSo prf
+    (False ** _)  => retryUntil_withPrf p f fl
+
+||| More elegant version of `suchThat` for fuelled generators.
+|||
+||| Tries to repeat generation until there is some fuel, and fallback to `suchThat` in case there isn't.
+public export %inline
+retryUntil : (p : a -> Bool) -> (Fuel -> Gen em a) -> Fuel -> Gen0 a
+retryUntil p f = map fst . retryUntil_withPrf p f
+
+||| More elegant version of `suchThat_dec` for fuelled generators.
+|||
+||| Tries to repeat generation until there is some fuel, and fallback to `suchThat_dec` in case there isn't.
+export
+retryUntil_dec : (p : (x : a) -> Dec (prop x)) -> (Fuel -> Gen em a) -> Fuel -> Gen0 $ Subset a prop
+retryUntil_dec p f Dry           = f Dry `suchThat_dec` p
+retryUntil_dec p f fl'@(More fl) = do
+  x <- relax $ f fl'
+  case p x of
+    Yes p => pure $ Element x p
+    No _  => retryUntil_dec p f fl
 
 -------------------------------
 --- Variation in generation ---

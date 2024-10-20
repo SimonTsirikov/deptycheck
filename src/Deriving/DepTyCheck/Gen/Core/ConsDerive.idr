@@ -13,6 +13,41 @@ import public Deriving.DepTyCheck.Gen.Derive
 
 %default total
 
+record TypeApp (0 con : Con) where
+  constructor MkTypeApp
+  argHeadType : TypeInfo
+  {auto 0 argHeadTypeGood : AllTyArgsNamed argHeadType}
+  argApps : Vect argHeadType.args.length .| Either (Fin con.args.length) TTImp
+
+getTypeApps : Elaboration m => NamesInfoInTypes => (con : Con) -> m $ Vect con.args.length $ TypeApp con
+getTypeApps con = do
+  let conArgIdxs = SortedMap.fromList $ mapI con.args $ \idx, arg => (argName arg, idx)
+
+  -- Analyse that we can do subgeneration for each constructor argument
+  -- Fails using `Elaboration` if the given expression is not an application to a type constructor
+  let analyseTypeApp : TTImp -> m $ TypeApp con
+      analyseTypeApp expr = do
+        let (lhs, args) = unAppAny expr
+        ty <- case lhs of
+          IVar _ lhsName     => do let Nothing = lookupType lhsName -- TODO to support `lhsName` to be a type parameter of type `Type`
+                                     | Just found => pure found
+                                   -- we didn't found, failing, there are at least two reasons
+                                   failAt (getFC lhs) $ if isNamespaced lhsName
+                                     then "Data type `\{lhsName}` is unavailable at the site of derivation (forgotten import?)"
+                                     else "Usupported applications to a non-concrete type `\{lhsName}`"
+          IPrimVal _ (PrT t) => pure $ typeInfoForPrimType t
+          IType _            => pure typeInfoForTypeOfTypes
+          lhs@(IPi {})       => failAt (getFC lhs) "Fields with function types are not supported in constructors"
+          lhs                => failAt (getFC lhs) "Unsupported type of a constructor field: \{show lhs}"
+        let Yes lengthCorrect = decEq ty.args.length args.length
+          | No _ => failAt (getFC lhs) "INTERNAL ERROR: wrong count of unapp when analysing type application"
+        _ <- ensureTyArgsNamed ty
+        pure $ MkTypeApp ty $ rewrite lengthCorrect in args.asVect <&> \arg => case getExpr arg of
+          expr@(IVar _ n) => mirror . maybeToEither expr $ lookup n conArgIdxs
+          expr            => Right expr
+
+  for con.args.asVect $ analyseTypeApp . type
+
 -------------------------------------------------
 --- Derivation of a generator for constructor ---
 -------------------------------------------------
@@ -42,151 +77,127 @@ namespace NonObligatoryExts
   [LeastEffort] {default False simplificationHack : Bool} -> ConstructorDerivator where
     consGenExpr sig con givs fuel = do
 
-      let niit : NamesInfoInTypes = %search    -- I don't why it won't be found without this
+      -- Prepare local search context
+      let _ : NamesInfoInTypes = %search    -- I don't why it won't be found without this
+
+      -- Log all arguments' position and their names (if they have some)
+      logPoint {level=15} "least-effort" [sig, con] "- con args: \{List.allFins con.args.length}"
 
       -------------------------------------------------------------
       -- Prepare intermediate data and functions using this data --
       -------------------------------------------------------------
 
-      -- Get file position of the constructor definition (for better error reporting)
-      let conFC = getFC con.type
-
       -- Build a map from constructor's argument name to its index
       let conArgIdxs = SortedMap.fromList $ mapI con.args $ \idx, arg => (argName arg, idx)
 
-      -- Analyse that we can do subgeneration for each constructor argument
-      -- Fails using `Elaboration` if the given expression is not an application to a type constructor
-      let analyseTypeApp : TTImp -> m TypeApp
-          analyseTypeApp expr = do
-            let (lhs, args) = unAppAny expr
-            ty <- case lhs of
-              IVar _ lhsName     => do let e = failAt (getFC lhs) $ "Only applications to non-polymorphic type constructors are supported"
-                                                                 ++ " at the moment, we found `\{lhsName}`"
-                                       maybe e pure $ lookupType lhsName -- TODO to support `lhsName` to be a type parameter of type `Type`
-              IPrimVal _ (PrT t) => pure $ typeInfoForPrimType t
-              IType _            => pure typeInfoForTypeOfTypes
-              lhs                => failAt (getFC lhs) "Only applications to a name is supported, given \{lhs}"
-            let Yes lengthCorrect = decEq ty.args.length args.length
-              | No _ => failAt (getFC lhs) "INTERNAL ERROR: wrong count of unapp when analysing type application"
-            _ <- ensureTyArgsNamed ty
-            pure $ MkTypeApp ty $ rewrite lengthCorrect in args.asVect <&> \arg => case getExpr arg of
-              expr@(IVar _ n) => mirror . maybeToEither expr $ lookup n conArgIdxs
-              expr            => Right expr
-
       -- Compute left-to-right need of generation when there are non-trivial types at the left
-      argsTypeApps <- for con.args.asVect $ analyseTypeApp . type
+      argsTypeApps <- getTypeApps con
+
+      -- Get dependencies of constructor's arguments
+      let rawDeps' = argDeps con.args
+      let rawDeps : Vect _ $ SortedSet $ Fin con.args.length := downmap (mapIn weakenToSuper) rawDeps'
+      let dependees = concat rawDeps -- arguments which any other argument depends on
 
       -- Decide how constructor arguments would be named during generation
-      let bindNames : Vect (con.args.length) String
-          bindNames = flip mapI .| fromList con.args .| \_ => bindNameRenamer . argName
+      let bindNames = withIndex (fromList con.args) <&> map (bindNameRenamer . argName)
+
+      -- Form the expression of calling the current constructor
+      let callCons = do
+        let constructorCall = callCon con $ bindNames <&> \(idx, n) => if contains idx dependees then implicitTrue else varStr n
+        let wrapImpls : Nat -> TTImp
+            wrapImpls Z     = constructorCall
+            wrapImpls (S n) = var `{Builtin.DPair.MkDPair} .$ implicitTrue .$ wrapImpls n
+        let consExpr = wrapImpls $ sig.targetType.args.length `minus` sig.givenParams.size
+        `(Prelude.pure {f=Test.DepTyCheck.Gen.Gen _} ~consExpr)
 
       -- Derive constructor calling expression for given order of generation
       let genForOrder : List (Fin con.args.length) -> m TTImp
-          genForOrder order = foldr apply callCons <$> evalStateT givs (for order genForOneArg) where
+          -- ... state is the set of arguments that are already present (given or generated)
+          genForOrder order = map (foldr apply callCons) $ evalStateT givs $ for order $ \genedArg => do
 
-            -- ... state is the set of arguments that are already present (given or generated)
-            genForOneArg : forall m.
-                           CanonicGen m =>
-                           MonadState (SortedSet $ Fin con.args.length) m =>
-                           (gened : Fin con.args.length) -> m $ TTImp -> TTImp
-            genForOneArg genedArg = do
+            -- Get info for the `genedArg`
+            let MkTypeApp typeOfGened argsOfTypeOfGened = index genedArg $ the (Vect _ $ TypeApp con) argsTypeApps
 
-              -- Get info for the `genedArg`
-              let MkTypeApp typeOfGened argsOfTypeOfGened = index genedArg $ the (Vect _ TypeApp) argsTypeApps
+            -- Acquire the set of arguments that are already present
+            presentArguments <- get
 
-              -- Acquire the set of arguments that are already present
-              presentArguments <- get
+            -- TODO to put the following check as up as possible as soon as it typecheks O_O
+            -- Check that those argument that we need to generate is not already present
+            let False = contains genedArg presentArguments
+              | True => pure id
 
-              -- TODO to put the following check as up as possible as soon as it typecheks O_O
-              -- Check that those argument that we need to generate is not already present
-              let False = contains genedArg presentArguments
-                | True => pure id
+            -- Filter arguments classification according to the set of arguments that are left to be generated;
+            -- Those which are `Right` are given, those which are `Left` are needs to be generated.
+            let depArgs : Vect typeOfGened.args.length (Either (Fin con.args.length) TTImp) := argsOfTypeOfGened <&> \case
+              Right expr => Right expr
+              Left i     => if contains i presentArguments then Right $ var $ argName $ index' con.args i else Left i
 
-              -- Filter arguments classification according to the set of arguments that are left to be generated;
-              -- Those which are `Right` are given, those which are `Left` are needs to be generated.
-              let depArgs : Vect typeOfGened.args.length (Either (Fin con.args.length) TTImp) := argsOfTypeOfGened <&> \case
-                Right expr => Right expr
-                Left i     => if contains i presentArguments then Right $ var $ argName $ index' con.args i else Left i
+            -- Determine which arguments will be on the left of dpair in subgen call, in correct order
+            let subgeneratedArgs = mapMaybe getLeft $ toList depArgs
 
-              -- Determine which arguments will be on the left of dpair in subgen call, in correct order
-              let subgeneratedArgs = mapMaybe getLeft $ toList depArgs
+            -- Make sure generated arguments will not be generated again
+            modify $ insert genedArg . union (fromList subgeneratedArgs)
 
-              -- Make sure generated arguments will not be generated again
-              modify $ insert genedArg . union (fromList subgeneratedArgs)
+            -- Form a task for subgen
+            let (subgivensLength ** subgivens) = mapMaybe (\(ie, idx) => (idx,) <$> getRight ie) $ depArgs `zip` Fin.range
+            let subsig : GenSignature := MkGenSignature typeOfGened $ fromList $ fst <$> toList subgivens
+            let Yes Refl = decEq subsig.givenParams.size subgivensLength
+              | No _ => fail "INTERNAL ERROR: error in given params set length computation"
 
-              -- Form a task for subgen
-              let (subgivensLength ** subgivens) = mapMaybe (\(ie, idx) => (idx,) <$> getRight ie) $ depArgs `zip` Fin.range
-              let subsig : GenSignature := MkGenSignature typeOfGened $ fromList $ fst <$> toList subgivens
-              let Yes Refl = decEq subsig.givenParams.size subgivensLength
-                | No _ => fail "INTERNAL ERROR: error in given params set length computation"
+            -- Check if called subgenerator can call the current one
+            let mutRec = hasNameInsideDeep sig.targetType.name $ var subsig.targetType.name
 
-              -- Check if called subgenerator can call the current one
-              let mutRec = hasNameInsideDeep sig.targetType.name $ var subsig.targetType.name
+            -- Decide whether to use local (decreasing) or outmost fuel, depending on whether we are in mutual recursion with subgen
+            let subfuel = if mutRec then fuel else var outmostFuelArg
 
-              -- Decide whether to use local (decreasing) or outmost fuel, depending on whether we are in mutual recursion with subgen
-              let subfuel = if mutRec then fuel else var outmostFuelArg
+            -- Form an expression to call the subgen
+            subgenCall <- callGen subsig subfuel $ snd <$> subgivens
 
-              -- Form an expression to call the subgen
-              subgenCall <- callGen subsig subfuel $ snd <$> subgivens
+            -- Form an expression of binding the result of subgen
+            let genedArg:::subgeneratedArgs = genedArg:::subgeneratedArgs <&> bindVar . snd . flip Vect.index bindNames
+            let bindSubgenResult = foldr (\l, r => var `{Builtin.DPair.MkDPair} .$ l .$ r) genedArg subgeneratedArgs
 
-              -- Form an expression of binding the result of subgen
-              let genedArg:::subgeneratedArgs = genedArg:::subgeneratedArgs <&> bindVar . flip Vect.index bindNames
-              let bindSubgenResult = foldr (\l, r => var `{Builtin.DPair.MkDPair} .$ l .$ r) genedArg subgeneratedArgs
+            -- Form an expression of the RHS of a bind; simplify lambda if subgeneration result type does not require pattern matching
+            let bindRHS = \cont => case bindSubgenResult of
+                                     IBindVar _ n => lam (MkArg MW ExplicitArg (Just $ UN $ Basic n) implicitFalse) cont
+                                     _            => `(\ ~bindSubgenResult => ~cont)
 
-              -- Form an expression of the RHS of a bind; simplify lambda if subgeneration result type does not require pattern matching
-              let bindRHS = \cont => case bindSubgenResult of
-                                       IBindVar _ n => lam (MkArg MW ExplicitArg (Just $ UN $ Basic n) implicitFalse) cont
-                                       _            => `(\ ~bindSubgenResult => ~cont)
-
-              -- Chain the subgen call with a given continuation
-              pure $ \cont => `(~subgenCall >>= ~(bindRHS cont))
-
-            callCons : TTImp
-            callCons = do
-              let constructorCall = callCon con $ bindNames <&> varStr
-              let wrapImpls : Nat -> TTImp
-                  wrapImpls Z     = constructorCall
-                  wrapImpls (S n) = var `{Builtin.DPair.MkDPair} .$ implicitTrue .$ wrapImpls n
-              let consExpr = wrapImpls $ sig.targetType.args.length `minus` sig.givenParams.size
-              `(Prelude.pure {f=Test.DepTyCheck.Gen.Gen _} ~consExpr)
-
-      -- Get dependencies of constructor's arguments
-      rawDeps <- argDeps con.args
-      let deps = downmap ((`difference` givs) . mapIn weakenToSuper) rawDeps
+            -- Chain the subgen call with a given continuation
+            pure $ \cont => `(~subgenCall >>= ~(bindRHS cont))
 
       -------------------------------------------------
       -- Left-to-right generation phase (2nd phase) ---
       -------------------------------------------------
 
       -- Determine which arguments need to be generated in a left-to-right manner
-      let (leftToRightArgsTypeApp, leftToRightArgs) = unzip $ filter (\((MkTypeApp _ as), _) => any isRight as) $ toListI argsTypeApps
+      let (leftToRightArgsTypeApp, leftToRightArgs) = unzip $ filter (\(ta, _) => any isRight ta.argApps) $ toListI argsTypeApps
 
       --------------------------------------------------------------------------------
       -- Preparation of input for the left-to-right phase (1st right-to-left phase) --
       --------------------------------------------------------------------------------
 
       -- Acquire those variables that appear in non-trivial type expressions, i.e. those which needs to be generated before the left-to-right phase
-      let preLTR = leftToRightArgsTypeApp >>= \(MkTypeApp _ as) => rights (toList as) >>= allVarNames
+      let preLTR = leftToRightArgsTypeApp >>= \ta => rights (toList ta.argApps) >>= allVarNames
       let preLTR = SortedSet.fromList $ mapMaybe (lookup' conArgIdxs) preLTR
 
       -- Find rightmost arguments among `preLTR`
       let depsLTR = SortedSet.fromList $
                       mapMaybe (\(ds, idx) => whenT .| contains idx preLTR && null ds .| idx) $
-                        toListI $ deps <&> intersection preLTR
+                        toListI $ rawDeps <&> intersection preLTR . (`difference` givs)
 
       ---------------------------------------------------------------------------------
       -- Main right-to-left generation phase (3rd phase aka 2nd right-to-left phase) --
       ---------------------------------------------------------------------------------
 
       -- Arguments that no other argument depends on
-      let rightmostArgs = fromFoldable {f=Vect _} range `difference` (givs `union` concat deps)
+      let rightmostArgs = fromFoldable {f=Vect _} range `difference` (givs `union` dependees)
 
       ---------------------------------------------------------------
       -- Manage different possible variants of generation ordering --
       ---------------------------------------------------------------
 
       -- Prepare info about which arguments are independent and thus can be ordered arbitrarily
-      let disjDeps = disjointDepSets rawDeps givs
+      let disjDeps = disjointDepSets rawDeps' givs
 
       -- Acquire order(s) in what we will generate arguments
       let allOrders = do
@@ -195,6 +206,10 @@ namespace NonObligatoryExts
         pure $ leftmost ++ leftToRightArgs ++ rightmost
 
       let allOrders = if simplificationHack then take 1 allOrders else allOrders
+      let allOrders = List.nub $ nub <$> allOrders
+
+      for_ allOrders $ \order =>
+        logPoint {level=10} "least-effort" [sig, con] "- used final order: \{order}"
 
       --------------------------
       -- Producing the result --
@@ -204,13 +219,13 @@ namespace NonObligatoryExts
 
       where
 
-        -- TODO make this to be a `record` as soon as #2177 is fixed
-        data TypeApp : Type where
-          MkTypeApp :
-            (type : TypeInfo) ->
-            (0 _ : AllTyArgsNamed type) =>
-            (argTypes : Vect type.args.length .| Either (Fin con.args.length) TTImp) ->
-            TypeApp
+        Interpolation (Fin con.args.length) where
+          interpolate i = case name $ index' con.args i of
+            Just (UN n) => "#\{show i} (\{show n})"
+            _           => "#\{show i}"
+
+        Foldable f => Interpolation (f $ Fin con.args.length) where
+          interpolate = ("[" ++) . (++ "]") . joinBy ", " . map interpolate . toList
 
   ||| Best effort non-obligatory tactic tries to use as much external generators as possible
   ||| but discards some there is a conflict between them.

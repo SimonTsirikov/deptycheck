@@ -28,11 +28,7 @@ canonicConsBody sig name con = do
 
   -- Acquire constructor's return type arguments
   let (conRetTy, conRetTypeArgs) = unAppAny con.type
-  conRetTypeArgs <- for conRetTypeArgs $ \case -- resembles similar management from `Entry` module; they must be consistent
-    PosApp e     => pure e
-    NamedApp _ _ => failAt conFC "Named implicit applications (like to `\{show conRetTy}`) are not supported yet"
-    AutoApp _    => failAt conFC "Auto-implicit applications (like to `\{show conRetTy}`) are not supported yet"
-    WithApp _    => failAt conFC "Unexpected `with` application to `\{show conRetTy}` in a constructor's argument"
+  let conRetTypeArgs = conRetTypeArgs <&> getExpr
 
   -- Match lengths of `conRetTypeArgs` and `sig.targetType.args`
   let Yes conRetTypeArgsLengthCorrect = conRetTypeArgs.length `decEq` sig.targetType.args.length
@@ -66,7 +62,7 @@ canonicConsBody sig name con = do
         renamedAppliedNames <- for appliedNames.asVect $ \(name, typeDetermined) => do
           let bindName = bindNameRenamer name
           if cast typeDetermined
-            then pure $ const `(_) -- no need to match type-determined parameter by hand
+            then pure $ const implicitTrue -- no need to match type-determined parameter by hand
             else if contains name !get
             then do
               -- I'm using a name containing chars that cannot be present in the code parsed from the Idris frontend

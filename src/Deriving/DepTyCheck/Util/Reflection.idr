@@ -261,6 +261,10 @@ allNameSuffixes nm = do
     [] => n
     ns => NS (MkNS $ reverse ns) n
 
+export
+isNamespaced : Name -> Bool
+isNamespaced = not . null . fst . unNS
+
 ---------------------------------------------------
 --- Working around primitive and special values ---
 ---------------------------------------------------
@@ -311,105 +315,6 @@ extractTargetTyExpr ti = var ti.name
 ||| Returns a type constructor as `Con` by given type
 typeCon : TypeInfo -> Con
 typeCon ti = MkCon ti.name ti.args type
-
-----------------------------------------------
---- Analyzing dependently typed signatures ---
-----------------------------------------------
-
-export
-doesTypecheckAs : Elaboration m => (0 expected : Type) -> TTImp -> m Bool
-doesTypecheckAs expected expr = try .| check {expected} expr $> True .| pure False
-
-export
-argDeps : Elaboration m => (args : List Arg) -> m $ DVect args.length $ SortedSet . Fin . Fin.finToNat
-argDeps args = do
-  ignore $ check {expected=Type} $ fullSig defaultRet -- we can't return trustful result if given arguments do not form a nice Pi type
-  concatMap depsOfOne range
-
-  where
-
-  %unbound_implicits off -- this is a workaround of https://github.com/idris-lang/Idris2/issues/2040
-
-  filteredArgs : (excluded : SortedSet $ Fin args.length) -> List Arg
-  filteredArgs excluded = filterI args $ \idx, _ => not $ contains idx excluded
-
-  partialSig : (retTy : TTImp) -> (excluded : SortedSet $ Fin args.length) -> TTImp
-  partialSig retTy = piAll retTy . map {piInfo := ExplicitArg} . filteredArgs
-
-  partialApp : (appliee : Name) -> (excluded : SortedSet $ Fin args.length) -> TTImp
-  partialApp n = appNames n . map argName . filteredArgs
-
-  fullSig : (retTy : TTImp) -> TTImp
-  fullSig t = partialSig t empty
-
-  fullApp : (appliee : Name) -> TTImp
-  fullApp n = partialApp n empty
-
-  defaultRet : TTImp
-  defaultRet = `(Builtin.Unit)
-
-  -- This is for check that *meaning* of types are preversed after excluding some of arguments
-  --
-  -- Example:
-  --   Consider that `args` form the following: `(n : Nat) -> (a : Type) -> (v : Vect n a) -> (x : Nat) -> ...`
-  --   Consider we have `excluded` set containing only index 3 (the `x : Nat` argument).
-  --   For this case this function would return the following type:
-  --   ```
-  --     (full : (n : Nat) -> (a : Type) -> (v : Vect n a) -> (x : Nat) -> Unit) ->
-  --     (part : (n : Nat) -> (a : Type) -> (v : Vect n a) -> Unit) ->
-  --     (n : Nat) -> (a : Type) -> (v : Vect n a) -> (x : Nat) ->
-  --     full n a v x = part n a v
-  --   ```
-  --   As soon as this expression typechecks as `Type`, we are confident that
-  --   corresponding parameters of the full and the partial signatures are compatible, i.e.
-  --   removing of the parameters from `excluded` set does not change left types too much.
-  preservationCheckSig : (excluded : SortedSet $ Fin args.length) -> TTImp
-  preservationCheckSig excluded =
-    pi (MkArg MW ExplicitArg .| Just full .| fullSig defaultRet) $
-    pi (MkArg MW ExplicitArg .| Just part .| partialSig defaultRet excluded) $
-    fullSig $
-    `(Builtin.Equal) .$ fullApp full .$ partialApp part excluded
-    where
-      full, part : Name
-      full = MN "full" 1
-      part = MN "part" 1
-
-  checkExcluded : (excluded : SortedSet $ Fin args.length) -> m Bool
-  checkExcluded excluded = doesTypecheckAs Type (partialSig defaultRet excluded)
-                        && doesTypecheckAs Type (preservationCheckSig excluded)
-
-  -- Returns a set of indices of all arguments that do depend on the given
-  depsOfOne' : (idx : Fin args.length) -> m $ SortedSet $ Fin args.length
-  depsOfOne' idx = do
-    let cands = allGreaterThan idx
-    findMinExclude cands $ fromList cands
-
-    where
-      -- tries to add candidates one by one, and leave them if typechecks without the current `idx`
-      findMinExclude : (left : List $ Fin args.length) -> (currExcl : SortedSet $ Fin args.length) -> m $ SortedSet $ Fin args.length
-      findMinExclude [] excl = pure excl
-      findMinExclude (x::xs) prevExcl = do
-        let currExcl = delete x prevExcl
-        findMinExclude xs $ if !(checkExcluded $ insert idx currExcl) then currExcl else prevExcl
-
-  depsOfOne : Fin args.length -> m $ DVect args.length $ SortedSet . Fin . Fin.finToNat
-  depsOfOne idx = do
-    whoDependsOnIdx <- depsOfOne' idx
-    sequence $ tabulateI $ \i =>
-      if contains i whoDependsOnIdx
-      then do
-        let Just dep = tryToFit idx
-          | Nothing => fail "INTERNAL ERROR: unable to fit fins during dependency calculation"
-        pure $ singleton dep
-      else pure empty
-
-  %unbound_implicits on -- this is a workaround of https://github.com/idris-lang/Idris2/issues/2039
-
-  Semigroup a => Applicative f => Semigroup (f a) where
-    a <+> b = [| a <+> b |]
-
-  Monoid a => Applicative f => Monoid (f a) where
-    neutral = pure neutral
 
 ------------------------------------
 --- Analysis of type definitions ---
@@ -484,110 +389,17 @@ export
 allVarNames : TTImp -> List Name
 allVarNames = SortedSet.toList . allVarNames'
 
-export
-record NamesInfoInTypes where
-  constructor Names
-  types : SortedMap Name TypeInfo
-  cons  : SortedMap Name (TypeInfo, Con)
-  namesInTypes : SortedMap TypeInfo $ SortedSet Name
-
-lookupByType : NamesInfoInTypes => Name -> Maybe $ SortedSet Name
-lookupByType @{tyi} = lookup' tyi.types >=> lookup' tyi.namesInTypes
-
-lookupByCon : NamesInfoInTypes => Name -> Maybe $ SortedSet Name
-lookupByCon @{tyi} = concatMap @{Deep} lookupByType . SortedSet.toList . concatMap allVarNames' . conSubexprs . snd <=< lookup' tyi.cons
-
-typeByCon : NamesInfoInTypes => Con -> Maybe TypeInfo
-typeByCon @{tyi} = map fst . lookup' tyi.cons . name
+public export
+0 ArgDeps : Nat -> Type
+ArgDeps n = DVect n $ SortedSet . Fin . Fin.finToNat
 
 export
-lookupType : NamesInfoInTypes => Name -> Maybe TypeInfo
-lookupType @{tyi} = lookup' tyi.types
-
-export
-lookupCon : NamesInfoInTypes => Name -> Maybe Con
-lookupCon @{tyi} n = snd <$> lookup n tyi.cons
-                 <|> typeCon <$> lookup n tyi.types
-
-||| Returns either resolved expression, or a non-unique name and the set of alternatives.
--- We could use `Validated (SortedMap Name $ SortedSet Name) TTImp` as the result, if we depended on `contrib`.
--- NOTICE: this function does not resolve re-export aliases, say, it does not resolve `Prelude.Nil` to `Prelude.Basics.Nil`.
-export
-resolveNamesUniquely : NamesInfoInTypes => (freeNames : SortedSet Name) -> TTImp -> Either (Name, SortedSet Name) TTImp
-resolveNamesUniquely @{tyi} freeNames = do
-  let allConsideredNames = keySet tyi.types `union` keySet tyi.cons
-  let reverseNamesMap = concatMap (uncurry SortedMap.singleton) $ allConsideredNames.asList >>= \n => allNameSuffixes n <&> (, SortedSet.singleton n)
-  mapATTImp' $ \case
-    v@(IVar fc n) => if contains n freeNames then id else do
-                       let Just resolvedAlts = lookup n reverseNamesMap | Nothing => id
-                       let [resolved] = SortedSet.toList resolvedAlts
-                         | _ => const $ Left (n, resolvedAlts)
-                       const $ pure $ IVar fc resolved
-    _ => id
-
-Semigroup NamesInfoInTypes where
-  Names ts cs nit <+> Names ts' cs' nit' = Names (ts `mergeLeft` ts') (cs `mergeLeft` cs') (nit <+> nit')
-
-Eq TypeInfo where (==) = (==) `on` name
-Ord TypeInfo where compare = comparing name
-
-Monoid NamesInfoInTypes where
-  neutral = Names empty empty empty
-
-export
-hasNameInsideDeep : NamesInfoInTypes => Name -> TTImp -> Bool
-hasNameInsideDeep @{tyi} nm = hasInside empty . allVarNames where
-
-  hasInside : (visited : SortedSet Name) -> (toLook : List Name) -> Bool
-  hasInside visited []           = False
-  hasInside visited (curr::rest) = if curr == nm then True else do
-    let new = if contains curr visited then [] else maybe [] SortedSet.toList $ lookupByType curr
-    -- visited is limited and either growing or `new` is empty, thus `toLook` is strictly less
-    assert_total $ hasInside (insert curr visited) (new ++ rest)
-
-export
-isRecursive : NamesInfoInTypes => (con : Con) -> {default Nothing containingType : Maybe TypeInfo} -> Bool
-isRecursive con = case the (Maybe TypeInfo) $ containingType <|> typeByCon con of
-  Just containingType => any (hasNameInsideDeep containingType.name) $ conSubexprs con
-  Nothing             => False
-
--- returns `Nothing` if given name is not a constructor
-export
-isRecursiveConstructor : NamesInfoInTypes => Name -> Maybe Bool
-isRecursiveConstructor @{tyi} n = lookup' tyi.cons n <&> \(ty, con) => isRecursive {containingType=Just ty} con
-
-export
-getNamesInfoInTypes : Elaboration m => TypeInfo -> m NamesInfoInTypes
-getNamesInfoInTypes ty = go neutral [ty]
-  where
-
-    subexprs : TypeInfo -> List TTImp
-    subexprs ty = map type ty.args ++ (ty.cons >>= conSubexprs)
-
-    go : NamesInfoInTypes -> List TypeInfo -> m NamesInfoInTypes
-    go tyi []         = pure tyi
-    go tyi (ti::rest) = do
-      ti <- normaliseCons ti
-      let subes = concatMap allVarNames' $ subexprs ti
-      new <- map join $ for (SortedSet.toList subes) $ \n =>
-               if isNothing $ lookupByType n
-                 then map toList $ catch $ getInfo' n
-                 else pure []
-      let next = { types $= insert ti.name ti
-                 , namesInTypes $= insert ti subes
-                 , cons $= mergeLeft $ fromList $ ti.cons <&> \con => (con.name, ti, con)
-                 } tyi
-      assert_total $ go next (new ++ rest)
-
-export
-getNamesInfoInTypes' : Elaboration m => TTImp -> m NamesInfoInTypes
-getNamesInfoInTypes' expr = do
-  let varsFirstOrder = allVarNames expr
-  varsSecondOrder <- map concat $ Prelude.for varsFirstOrder $ \n => do
-                       ns <- getType n
-                       pure $ SortedSet.insert n $ flip concatMap ns $ \(n', ty) => insert n' $ allVarNames' ty
-  tys <- map (mapMaybe id) $ for (SortedSet.toList varsSecondOrder) $ catch . getInfo'
-  concat <$> Prelude.for tys getNamesInfoInTypes
+argDeps : (args : List Arg) -> ArgDeps args.length
+argDeps args = do
+  let nameToIndices = SortedMap.fromList $ mapI args $ \i, arg => (argName arg, SortedSet.singleton i)
+  let args = Vect.fromList args <&> \arg => allVarNames arg.type |> map (fromMaybe empty . lookup' nameToIndices)
+  flip upmapI args $ \i, deps => flip concatMap deps $ \candidates =>
+    maybe empty singleton $ last' $ mapMaybe tryToFit $ SortedSet.toList candidates
 
 public export
 isVar : TTImp -> Bool
@@ -707,3 +519,111 @@ genTypeName g = do
   let (IVar _ genTy, _) = unApp genTy
     | (genTy, _) => failAt (getFC genTy) "Expected a type name"
   pure genTy
+
+---------------------------
+--- Names info in types ---
+---------------------------
+
+export
+record NamesInfoInTypes where
+  constructor Names
+  types : SortedMap Name TypeInfo
+  cons  : SortedMap Name (TypeInfo, Con)
+  namesInTypes : SortedMap TypeInfo $ SortedSet Name
+
+lookupByType : NamesInfoInTypes => Name -> Maybe $ SortedSet Name
+lookupByType @{tyi} = lookup' tyi.types >=> lookup' tyi.namesInTypes
+
+lookupByCon : NamesInfoInTypes => Name -> Maybe $ SortedSet Name
+lookupByCon @{tyi} = concatMap @{Deep} lookupByType . SortedSet.toList . concatMap allVarNames' . conSubexprs . snd <=< lookup' tyi.cons
+
+typeByCon : NamesInfoInTypes => Con -> Maybe TypeInfo
+typeByCon @{tyi} = map fst . lookup' tyi.cons . name
+
+export
+lookupType : NamesInfoInTypes => Name -> Maybe TypeInfo
+lookupType @{tyi} = lookup' tyi.types
+
+export
+lookupCon : NamesInfoInTypes => Name -> Maybe Con
+lookupCon @{tyi} n = snd <$> lookup n tyi.cons
+                 <|> typeCon <$> lookup n tyi.types
+
+||| Returns either resolved expression, or a non-unique name and the set of alternatives.
+-- We could use `Validated (SortedMap Name $ SortedSet Name) TTImp` as the result, if we depended on `contrib`.
+-- NOTICE: this function does not resolve re-export aliases, say, it does not resolve `Prelude.Nil` to `Prelude.Basics.Nil`.
+export
+resolveNamesUniquely : NamesInfoInTypes => (freeNames : SortedSet Name) -> TTImp -> Either (Name, SortedSet Name) TTImp
+resolveNamesUniquely @{tyi} freeNames = do
+  let allConsideredNames = keySet tyi.types `union` keySet tyi.cons
+  let reverseNamesMap = concatMap (uncurry SortedMap.singleton) $ allConsideredNames.asList >>= \n => allNameSuffixes n <&> (, SortedSet.singleton n)
+  mapATTImp' $ \case
+    v@(IVar fc n) => if contains n freeNames then id else do
+                       let Just resolvedAlts = lookup n reverseNamesMap | Nothing => id
+                       let [resolved] = SortedSet.toList resolvedAlts
+                         | _ => const $ Left (n, resolvedAlts)
+                       const $ pure $ IVar fc resolved
+    _ => id
+
+Semigroup NamesInfoInTypes where
+  Names ts cs nit <+> Names ts' cs' nit' = Names (ts `mergeLeft` ts') (cs `mergeLeft` cs') (nit <+> nit')
+
+Monoid NamesInfoInTypes where
+  neutral = Names empty empty empty where
+    Eq TypeInfo where (==) = (==) `on` name
+    Ord TypeInfo where compare = comparing name
+
+export
+hasNameInsideDeep : NamesInfoInTypes => Name -> TTImp -> Bool
+hasNameInsideDeep @{tyi} nm = hasInside empty . allVarNames where
+
+  hasInside : (visited : SortedSet Name) -> (toLook : List Name) -> Bool
+  hasInside visited []           = False
+  hasInside visited (curr::rest) = if curr == nm then True else do
+    let new = if contains curr visited then [] else maybe [] SortedSet.toList $ lookupByType curr
+    -- visited is limited and either growing or `new` is empty, thus `toLook` is strictly less
+    assert_total $ hasInside (insert curr visited) (new ++ rest)
+
+export
+isRecursive : NamesInfoInTypes => (con : Con) -> {default Nothing containingType : Maybe TypeInfo} -> Bool
+isRecursive con = case the (Maybe TypeInfo) $ containingType <|> typeByCon con of
+  Just containingType => any (hasNameInsideDeep containingType.name) $ conSubexprs con
+  Nothing             => False
+
+-- returns `Nothing` if given name is not a constructor
+export
+isRecursiveConstructor : NamesInfoInTypes => Name -> Maybe Bool
+isRecursiveConstructor @{tyi} n = lookup' tyi.cons n <&> \(ty, con) => isRecursive {containingType=Just ty} con
+
+export
+getNamesInfoInTypes : Elaboration m => TypeInfo -> m NamesInfoInTypes
+getNamesInfoInTypes ty = go neutral [ty]
+  where
+
+    subexprs : TypeInfo -> List TTImp
+    subexprs ty = map type ty.args ++ (ty.cons >>= conSubexprs)
+
+    go : NamesInfoInTypes -> List TypeInfo -> m NamesInfoInTypes
+    go tyi []         = pure tyi
+    go tyi (ti::rest) = do
+      ti <- normaliseCons ti
+      let subes = concatMap allVarNames' $ subexprs ti
+      new <- map join $ for (SortedSet.toList subes) $ \n =>
+               if isNothing $ lookupByType n
+                 then map toList $ catch $ getInfo' n
+                 else pure []
+      let next = { types $= insert ti.name ti
+                 , namesInTypes $= insert ti subes
+                 , cons $= mergeLeft $ fromList $ ti.cons <&> \con => (con.name, ti, con)
+                 } tyi
+      assert_total $ go next (new ++ rest)
+
+export
+getNamesInfoInTypes' : Elaboration m => TTImp -> m NamesInfoInTypes
+getNamesInfoInTypes' expr = do
+  let varsFirstOrder = allVarNames expr
+  varsSecondOrder <- map concat $ Prelude.for varsFirstOrder $ \n => do
+                       ns <- getType n
+                       pure $ SortedSet.insert n $ flip concatMap ns $ \(n', ty) => insert n' $ allVarNames' ty
+  tys <- map (mapMaybe id) $ for (SortedSet.toList varsSecondOrder) $ catch . getInfo'
+  concat <$> Prelude.for tys getNamesInfoInTypes

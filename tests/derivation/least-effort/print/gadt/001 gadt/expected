@@ -1,8 +1,5 @@
-1/3: Building AlternativeCore (AlternativeCore.idr)
-2/3: Building PrintDerivation (PrintDerivation.idr)
-3/3: Building DerivedGen (DerivedGen.idr)
-LOG gen.auto.derive.infra:0: type: (arg : Fuel) -> (n : Nat) -> Gen MaybeEmpty (Fin n)
-LOG gen.auto.derive.infra:0: 
+1/1: Building DerivedGen (DerivedGen.idr)
+LOG deptycheck.derive.print:5: type: (arg : Fuel) -> (n : Nat) -> Gen MaybeEmpty (Fin n)
     MkArg MW ExplicitArg (Just "^outmost-fuel^") (var "Data.Fuel.Fuel")
 .=> MkArg MW ExplicitArg (Just "outer^<n>") implicitTrue
 .=> local
@@ -75,7 +72,7 @@ LOG gen.auto.derive.infra:0:
                                       .$ (    MkArg MW ExplicitArg (Just "^bnd^{arg:1}") implicitFalse
                                           .=>    var "Prelude.pure"
                                               .! ("f", var "Test.DepTyCheck.Gen.Gen" .$ implicitTrue)
-                                              .$ (var "Data.Fin.FS" .! ("k", var "k") .$ var "^bnd^{arg:1}")))
+                                              .$ (var "Data.Fin.FS" .! ("k", implicitTrue) .$ var "^bnd^{arg:1}")))
                              , var "<<Data.Fin.FS>>" .$ implicitTrue .$ implicitTrue .= var "empty"
                              ]
                          ]
